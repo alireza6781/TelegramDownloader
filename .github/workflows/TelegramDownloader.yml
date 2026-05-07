@@ -18,7 +18,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    
     steps:
       - name: 📂 Clone repository
         uses: actions/checkout@v4
@@ -28,60 +27,66 @@ jobs:
       - name: 🔧 Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl jq zip openssl
+          sudo apt-get install -y curl jq zip openssl aria2
 
       - name: 📡 Get direct link and fix spaces
         id: get_link
         run: |
           TELEGRAM_LINK="${{ github.event.inputs.telegram_link }}"
-          
           echo "═══════════════════════════════════════════════════════════════"
           echo "🔗 Telegram link: $TELEGRAM_LINK"
           echo "═══════════════════════════════════════════════════════════════"
           
+          # Note: Using the same proxy endpoint as before
           RESPONSE=$(curl -s -X POST \
             -H "User-Agent: Mozilla/5.0" \
             -d "telegram_link=$TELEGRAM_LINK" \
             https://telegramdownloader.net/proxy.php)
-          
+            
           RAW_URL=$(echo "$RESPONSE" | jq -r '.data.data.link')
           FILE_NAME=$(echo "$RESPONSE" | jq -r '.data.data.file_name')
           
           if [ -z "$RAW_URL" ] || [ "$RAW_URL" = "null" ]; then
             echo "❌ Error: Could not get download link!"
+            echo "Response: $RESPONSE"
             exit 1
           fi
           
           # Convert spaces to dash in URL
           CORRECTED_URL=$(echo "$RAW_URL" | sed 's/%20/-/g' | sed 's/ /-/g')
-          
           echo "✅ Direct link received!"
           echo "📄 Original filename: $FILE_NAME"
-          
           echo "download_url=$CORRECTED_URL" >> $GITHUB_OUTPUT
           echo "original_name=$FILE_NAME" >> $GITHUB_OUTPUT
 
-      - name: ⬇️ Download file with duplicate check
+      - name: ⬇️ Download file with aria2c
         id: download
         run: |
           URL="${{ steps.get_link.outputs.download_url }}"
           ORIGINAL_NAME="${{ steps.get_link.outputs.original_name }}"
           mkdir -p downloads
-          
-          # Check if file already exists
+
+          # Prepare filename with extension logic
           BASE_NAME="${ORIGINAL_NAME%.*}"
           EXT="${ORIGINAL_NAME##*.}"
+          
+          # If the file has no extension, EXT will be same as ORIGINAL_NAME
           if [[ "$EXT" == "$ORIGINAL_NAME" ]]; then
             EXT=""
           else
             EXT=".$EXT"
           fi
+          
           FINAL_NAME="$ORIGINAL_NAME"
           COUNTER=1
           
-          # Keep checking and increment counter until unique name found
+          # Check for duplicates
           while [ -f "downloads/$FINAL_NAME" ]; do
-            FINAL_NAME="${BASE_NAME}_${COUNTER}${EXT}"
+            if [ -n "$EXT" ]; then
+              FINAL_NAME="${BASE_NAME}_${COUNTER}${EXT}"
+            else
+              FINAL_NAME="${BASE_NAME}_${COUNTER}"
+            fi
             COUNTER=$((COUNTER + 1))
           done
           
@@ -91,42 +96,34 @@ jobs:
           
           echo "═══════════════════════════════════════════════════════════════"
           echo "⬇️ Downloading: $FINAL_NAME"
-          echo "URL: $URL" # برای دیباگ
+          echo "URL: $URL"
           echo "═══════════════════════════════════════════════════════════════"
 
-          # استفاده از --http1.1 برای حل مشکل INTERNAL_ERROR
-          # --max-time را کمی افزایش می‌دهیم (مثلا ۲ ساعت)
-          # --retry و --retry-delay را برای پایداری بیشتر نگه می‌داریم
-          curl -L --progress-bar \
-            --http1.1 \
-            --max-time 7200 \
-            --retry 5 \
-            --retry-delay 10 \
-            -C - \
-            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-            -H "Referer: https://telegramdownloader.net/" \
-            -o "downloads/$FINAL_NAME" \
-            "$URL"
+          # Download using aria2c
+          aria2c --dir=downloads \
+                 --out="$FINAL_NAME" \
+                 --header="User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+                 --header="Referer: https://telegramdownloader.net/" \
+                 --max-connection-per-server=16 \
+                 --min-split-size=1M \
+                 --retry-wait=30 \
+                 --max-tries=10 \
+                 --timeout=60 \
+                 --continue \
+                 "$URL"
 
-          # بررسی وضعیت خروجی curl
-          if [ $? -ne 0 ]; then
-            echo "❌ Download failed with exit code $?"
-            # اگر فایل ناقص است، آن را حذف می‌کنیم
-            rm -f "downloads/$FINAL_NAME"
-            exit 1
-          fi
-
+          # Verify download
           if [ ! -f "downloads/$FINAL_NAME" ]; then
-            echo "❌ File not found after download!"
+            echo "❌ Download failed! File not found."
             exit 1
           fi
 
           SIZE=$(stat -c%s "downloads/$FINAL_NAME")
           
-          # بررسی منطقی‌تر حجم فایل
-          if [ "$SIZE" -lt 1024 ]; then
-            echo "❌ ERROR: Invalid file (${SIZE} bytes) - Likely an error page or empty file"
-            cat "downloads/$FINAL_NAME" # چاپ محتوای فایل برای دیباگ
+          # Check if file is too small (likely an error page)
+          if [ "$SIZE" -lt 10240 ]; then
+            echo "❌ ERROR: Invalid file (${SIZE} bytes)"
+            cat "downloads/$FINAL_NAME" 2>/dev/null | head -n 10
             rm "downloads/$FINAL_NAME"
             exit 1
           fi
@@ -135,40 +132,52 @@ jobs:
           echo "✅ Download complete! Size: ${SIZE_MB} MB"
           echo "file_size=$SIZE" >> $GITHUB_OUTPUT
           echo "downloaded_name=$FINAL_NAME" >> $GITHUB_OUTPUT
+
       - name: ✂️ Split large file
         if: github.event.inputs.split_threshold_mb != '0'
         run: |
           THRESHOLD="${{ github.event.inputs.split_threshold_mb }}"
           FILENAME="${{ steps.download.outputs.downloaded_name }}"
           FILE_SIZE="${{ steps.download.outputs.file_size }}"
+          
+          # Calculate limit in bytes
           LIMIT=$((THRESHOLD * 1024 * 1024))
           
           if [ -n "$FILE_SIZE" ] && [ "$FILE_SIZE" -gt "$LIMIT" ]; then
             echo "✂️ Splitting into ${THRESHOLD}MB parts..."
             cd downloads
+            
+            # Create zip split
+            # -s: split size
+            # -j: junk paths (store just filenames)
             zip -s "${THRESHOLD}m" "${FILENAME}.zip" -j "$FILENAME"
+            
+            # Remove the original file, keeping only the zip parts
             rm "$FILENAME"
+            
             cd ..
           fi
 
       - name: 🔄 Fix filenames (remove Persian/Arabic, special chars)
         run: |
           cd downloads
-          
           for file in *; do
             [ -e "$file" ] || continue
-            
             EXT="${file##*.}"
+            
+            # Handle files without extension
             if [[ "$EXT" == "$file" ]]; then
               EXT="bin"
             fi
             
+            # Check if filename contains non-ASCII characters
             if [[ "$file" =~ [^[:ascii:]] ]]; then
               RANDOM_NAME=$(openssl rand -hex 8)
               NEW_NAME="${RANDOM_NAME}.${EXT}"
               echo "   🌐 Renaming: $file -> $NEW_NAME"
               mv "$file" "$NEW_NAME"
             else
+              # Clean special characters
               CLEAN_NAME=$(echo "$file" | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__*/_/g')
               if [ "$file" != "$CLEAN_NAME" ]; then
                 echo "   📝 Cleaning: $file -> $CLEAN_NAME"
@@ -176,7 +185,6 @@ jobs:
               fi
             fi
           done
-          
           cd ..
 
       - name: 📤 Upload to GitHub (Batch upload - 1 file at a time)
@@ -189,7 +197,7 @@ jobs:
             exit 1
           fi
           
-          # Get list of new files only (not already in git)
+          # Get list of new files only
           NEW_FILES=()
           for file in downloads/*; do
             filename=$(basename "$file")
@@ -201,7 +209,6 @@ jobs:
           done
           
           TOTAL=${#NEW_FILES[@]}
-          
           if [ "$TOTAL" -eq 0 ]; then
             echo "✅ No new files to upload!"
             exit 0
@@ -215,7 +222,6 @@ jobs:
           for (( i=0; i<TOTAL; i++ )); do
             echo ""
             echo "🚀 Uploading file $((i+1)) of $TOTAL: ${NEW_FILES[$i]}"
-            
             git add "downloads/${NEW_FILES[$i]}"
             git commit -m "Add ${NEW_FILES[$i]} [skip ci]"
             
@@ -234,7 +240,6 @@ jobs:
                 fi
               fi
             done
-            
             sleep 2
           done
           
