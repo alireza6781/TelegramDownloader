@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       telegram_link:
-        description: '🔗 Telegram post link (Public Channel/Group)'
+        description: '🔗 Telegram post link'
         required: true
         type: string
       split_threshold_mb:
@@ -18,6 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    
     steps:
       - name: 📂 Clone repository
         uses: actions/checkout@v4
@@ -27,103 +28,102 @@ jobs:
       - name: 🔧 Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl jq zip openssl aria2 yt-dlp python3-pip
-          pip3 install --break-system-packages requests
+          sudo apt-get install -y curl jq zip openssl
 
-      - name: 📡 Extract Post ID and Channel
-        id: extract
+      - name: 📡 Get direct link and fix spaces
+        id: get_link
         run: |
-          LINK="${{ github.event.inputs.telegram_link }}"
-          echo "🔗 Processing link: $LINK"
+          TELEGRAM_LINK="${{ github.event.inputs.telegram_link }}"
           
-          # Extract channel/username and post ID
-          # Format: https://t.me/channelname/postid
-          CHANNEL=$(echo "$LINK" | grep -oP '(?<=/)[^/]+(?=/)')
-          POST_ID=$(echo "$LINK" | grep -oP '(?<=/)[^/]+$')
+          echo "═══════════════════════════════════════════════════════════════"
+          echo "🔗 Telegram link: $TELEGRAM_LINK"
+          echo "═══════════════════════════════════════════════════════════════"
           
-          if [ -z "$CHANNEL" ] || [ -z "$POST_ID" ]; then
-            echo "❌ Could not extract channel or post ID from link."
-            echo "Please ensure the link is in format: https://t.me/channelname/postid"
+          RESPONSE=$(curl -s -X POST \
+            -H "User-Agent: Mozilla/5.0" \
+            -d "telegram_link=$TELEGRAM_LINK" \
+            https://telegramdownloader.net/proxy.php)
+          
+          RAW_URL=$(echo "$RESPONSE" | jq -r '.data.data.link')
+          FILE_NAME=$(echo "$RESPONSE" | jq -r '.data.data.file_name')
+          
+          if [ -z "$RAW_URL" ] || [ "$RAW_URL" = "null" ]; then
+            echo "❌ Error: Could not get download link!"
             exit 1
           fi
           
-          echo "📂 Channel: $CHANNEL"
-          echo "🆔 Post ID: $POST_ID"
+          # Convert spaces to dash in URL
+          CORRECTED_URL=$(echo "$RAW_URL" | sed 's/%20/-/g' | sed 's/ /-/g')
           
-          echo "channel=$CHANNEL" >> $GITHUB_OUTPUT
-          echo "post_id=$POST_ID" >> $GITHUB_OUTPUT
+          echo "✅ Direct link received!"
+          echo "📄 Original filename: $FILE_NAME"
+          
+          echo "download_url=$CORRECTED_URL" >> $GITHUB_OUTPUT
+          echo "original_name=$FILE_NAME" >> $GITHUB_OUTPUT
 
-      - name: ⬇️ Download file with yt-dlp
+      - name: ⬇️ Download file
         id: download
         run: |
-          CHANNEL="${{ steps.extract.outputs.channel }}"
-          POST_ID="${{ steps.extract.outputs.post_id }}"
+          URL="${{ steps.get_link.outputs.download_url }}"
+          ORIGINAL_NAME="${{ steps.get_link.outputs.original_name }}"
           
           mkdir -p downloads
           
           echo "═══════════════════════════════════════════════════════════════"
-          echo "⬇️ Downloading from t.me/$CHANNEL/$POST_ID"
+          echo "⬇️ Downloading..."
           echo "═══════════════════════════════════════════════════════════════"
-
-          # Use yt-dlp to download the media
-          # --no-check-cert: Skip certificate verification if needed
-          # -o: Output template
-          yt-dlp --no-check-cert \
-                 -o "downloads/%(title)s.%(ext)s" \
-                 "https://t.me/$CHANNEL/$POST_ID"
-
-          # Check if download was successful
-          if [ ! -f "downloads/*" ]; then
-            echo "❌ Download failed! No file found in downloads."
+          
+          curl -L --progress-bar \
+            --max-time 7200 \
+            --retry 10 \
+            --retry-delay 10 \
+            -C - \
+            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            -H "Referer: https://telegramdownloader.net/" \
+            -o "downloads/$ORIGINAL_NAME" \
+            "$URL"
+          
+          if [ ! -f "downloads/$ORIGINAL_NAME" ]; then
+            echo "❌ Download failed!"
             exit 1
           fi
-
-          # Get the downloaded file name
-          DOWNLOADED_FILE=$(ls downloads/* | head -n 1)
-          FINAL_NAME=$(basename "$DOWNLOADED_FILE")
           
-          SIZE=$(stat -c%s "$DOWNLOADED_FILE")
+          SIZE=$(stat -c%s "downloads/$ORIGINAL_NAME")
           
-          if [ "$SIZE" -lt 10240 ]; then
+          if [ "$SIZE" -lt 1024 ]; then
             echo "❌ ERROR: Invalid file (${SIZE} bytes)"
-            rm "$DOWNLOADED_FILE"
+            rm "downloads/$ORIGINAL_NAME"
             exit 1
           fi
-
+          
           SIZE_MB=$((SIZE / 1024 / 1024))
           echo "✅ Download complete! Size: ${SIZE_MB} MB"
           echo "file_size=$SIZE" >> $GITHUB_OUTPUT
-          echo "downloaded_name=$FINAL_NAME" >> $GITHUB_OUTPUT
 
       - name: ✂️ Split large file
         if: github.event.inputs.split_threshold_mb != '0'
         run: |
           THRESHOLD="${{ github.event.inputs.split_threshold_mb }}"
-          FILENAME="${{ steps.download.outputs.downloaded_name }}"
+          FILENAME="${{ steps.get_link.outputs.original_name }}"
           FILE_SIZE="${{ steps.download.outputs.file_size }}"
-          
           LIMIT=$((THRESHOLD * 1024 * 1024))
           
           if [ -n "$FILE_SIZE" ] && [ "$FILE_SIZE" -gt "$LIMIT" ]; then
             echo "✂️ Splitting into ${THRESHOLD}MB parts..."
             cd downloads
-            
-            # Create zip split
             zip -s "${THRESHOLD}m" "${FILENAME}.zip" -j "$FILENAME"
-            
-            # Remove the original file
             rm "$FILENAME"
-            
             cd ..
           fi
 
       - name: 🔄 Fix filenames (remove Persian/Arabic, special chars)
         run: |
           cd downloads
+          
           for file in *; do
             [ -e "$file" ] || continue
-            EXT="${file##*.}"
             
+            EXT="${file##*.}"
             if [[ "$EXT" == "$file" ]]; then
               EXT="bin"
             fi
@@ -141,9 +141,10 @@ jobs:
               fi
             fi
           done
+          
           cd ..
 
-      - name: 📤 Upload to GitHub (Batch upload - 1 file at a time)
+      - name: 📤 Upload to GitHub (Batch upload - Single Commit)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -152,57 +153,52 @@ jobs:
             echo "⚠️ No files to upload!"
             exit 1
           fi
+
+          # لیست فایل‌ها را دریافت کن
+          FILES=($(ls downloads/ | sort))
+          TOTAL=${#FILES[@]}
           
-          NEW_FILES=()
-          for file in downloads/*; do
-            filename=$(basename "$file")
-            if ! git ls-files --error-unmatch "downloads/$filename" &>/dev/null; then
-              NEW_FILES+=("$filename")
-            else
-              echo "⏭️ Skipping already uploaded file: $filename"
-            fi
+          echo "═══════════════════════════════════════════════════════════════"
+          echo "📦 Total files to upload: $TOTAL"
+          echo "═══════════════════════════════════════════════════════════════"
+
+          # همه فایل‌ها را یکجا اضافه کن
+          for file in "${FILES[@]}"; do
+            echo "   ➕ Adding: $file"
+            git add "downloads/$file"
           done
-          
-          TOTAL=${#NEW_FILES[@]}
-          if [ "$TOTAL" -eq 0 ]; then
-            echo "✅ No new files to upload!"
-            exit 0
-          fi
-          
-          echo "═══════════════════════════════════════════════════════════════"
-          echo "📦 Total new files to upload: $TOTAL"
-          echo "═══════════════════════════════════════════════════════════════"
-          
-          for (( i=0; i<TOTAL; i++ )); do
-            echo ""
-            echo "🚀 Uploading file $((i+1)) of $TOTAL: ${NEW_FILES[$i]}"
-            git add "downloads/${NEW_FILES[$i]}"
-            git commit -m "Add ${NEW_FILES[$i]} [skip ci]"
+
+          # اگر فایلی اضافه شده باشد، کامیت کن
+          if ! git diff --cached --quiet; then
+            echo "📝 Committing changes..."
+            git commit -m "Auto-download: Add $TOTAL files from Telegram [skip ci]"
             
-            for attempt in 1 2 3; do
+            # پش با تلاش مجدد
+            MAX_RETRIES=3
+            for attempt in $(seq 1 $MAX_RETRIES); do
+              echo "🚀 Push attempt $attempt of $MAX_RETRIES..."
               if git push origin main 2>&1; then
-                echo "   ✅ Uploaded successfully"
+                echo "   ✅ Upload successful!"
                 break
               else
-                if [ $attempt -lt 3 ]; then
-                  echo "   ⚠️ Push failed, retry $attempt/3..."
-                  git reset --soft HEAD~1
-                  sleep 5
-                else
-                  echo "   ❌ Failed to upload ${NEW_FILES[$i]}"
-                  git reset --soft HEAD~1
-                fi
+                echo "   ⚠️ Push failed. Retrying..."
+                sleep 10
               fi
             done
-            sleep 2
-          done
-          
+            
+            # اگر پش شکست خورد
+            if [ $attempt -eq $MAX_RETRIES ]; then
+              echo "   ❌ Failed to push after $MAX_RETRIES attempts."
+              echo "   💡 Tip: Check file sizes (must be < 100MB each) or GitHub status."
+              exit 1
+            fi
+          else
+            echo "⚠️ No new files to commit."
+          fi
+
           echo ""
           echo "═══════════════════════════════════════════════════════════════"
-          echo "🎉 All $TOTAL new files uploaded successfully!"
-          echo ""
-          echo "📂 Uploaded files:"
-          ls -lh downloads/
+          echo "🎉 All $TOTAL files processed!"
           echo "═══════════════════════════════════════════════════════════════"
 
       - name: 📋 Final report
