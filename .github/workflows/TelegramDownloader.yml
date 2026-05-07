@@ -66,7 +66,6 @@ jobs:
         run: |
           URL="${{ steps.get_link.outputs.download_url }}"
           ORIGINAL_NAME="${{ steps.get_link.outputs.original_name }}"
-          
           mkdir -p downloads
           
           # Check if file already exists
@@ -77,7 +76,6 @@ jobs:
           else
             EXT=".$EXT"
           fi
-          
           FINAL_NAME="$ORIGINAL_NAME"
           COUNTER=1
           
@@ -93,36 +91,50 @@ jobs:
           
           echo "═══════════════════════════════════════════════════════════════"
           echo "⬇️ Downloading: $FINAL_NAME"
+          echo "URL: $URL" # برای دیباگ
           echo "═══════════════════════════════════════════════════════════════"
-          
+
+          # استفاده از --http1.1 برای حل مشکل INTERNAL_ERROR
+          # --max-time را کمی افزایش می‌دهیم (مثلا ۲ ساعت)
+          # --retry و --retry-delay را برای پایداری بیشتر نگه می‌داریم
           curl -L --progress-bar \
+            --http1.1 \
             --max-time 7200 \
-            --retry 10 \
+            --retry 5 \
             --retry-delay 10 \
             -C - \
             -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
             -H "Referer: https://telegramdownloader.net/" \
             -o "downloads/$FINAL_NAME" \
             "$URL"
-          
-          if [ ! -f "downloads/$FINAL_NAME" ]; then
-            echo "❌ Download failed!"
+
+          # بررسی وضعیت خروجی curl
+          if [ $? -ne 0 ]; then
+            echo "❌ Download failed with exit code $?"
+            # اگر فایل ناقص است، آن را حذف می‌کنیم
+            rm -f "downloads/$FINAL_NAME"
             exit 1
           fi
-          
+
+          if [ ! -f "downloads/$FINAL_NAME" ]; then
+            echo "❌ File not found after download!"
+            exit 1
+          fi
+
           SIZE=$(stat -c%s "downloads/$FINAL_NAME")
           
+          # بررسی منطقی‌تر حجم فایل
           if [ "$SIZE" -lt 1024 ]; then
-            echo "❌ ERROR: Invalid file (${SIZE} bytes)"
+            echo "❌ ERROR: Invalid file (${SIZE} bytes) - Likely an error page or empty file"
+            cat "downloads/$FINAL_NAME" # چاپ محتوای فایل برای دیباگ
             rm "downloads/$FINAL_NAME"
             exit 1
           fi
-          
+
           SIZE_MB=$((SIZE / 1024 / 1024))
           echo "✅ Download complete! Size: ${SIZE_MB} MB"
           echo "file_size=$SIZE" >> $GITHUB_OUTPUT
           echo "downloaded_name=$FINAL_NAME" >> $GITHUB_OUTPUT
-
       - name: ✂️ Split large file
         if: github.event.inputs.split_threshold_mb != '0'
         run: |
