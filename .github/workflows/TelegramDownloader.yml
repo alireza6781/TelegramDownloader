@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       telegram_link:
-        description: '🔗 Telegram post link'
+        description: '🔗 Telegram post link (Public Channel/Group)'
         required: true
         type: string
       split_threshold_mb:
@@ -27,104 +27,66 @@ jobs:
       - name: 🔧 Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl jq zip openssl aria2
+          sudo apt-get install -y curl jq zip openssl aria2 yt-dlp python3-pip
+          pip3 install --break-system-packages requests
 
-      - name: 📡 Get direct link and fix spaces
-        id: get_link
+      - name: 📡 Extract Post ID and Channel
+        id: extract
         run: |
-          TELEGRAM_LINK="${{ github.event.inputs.telegram_link }}"
-          echo "═══════════════════════════════════════════════════════════════"
-          echo "🔗 Telegram link: $TELEGRAM_LINK"
-          echo "═══════════════════════════════════════════════════════════════"
+          LINK="${{ github.event.inputs.telegram_link }}"
+          echo "🔗 Processing link: $LINK"
           
-          # Note: Using the same proxy endpoint as before
-          RESPONSE=$(curl -s -X POST \
-            -H "User-Agent: Mozilla/5.0" \
-            -d "telegram_link=$TELEGRAM_LINK" \
-            https://telegramdownloader.net/proxy.php)
-            
-          RAW_URL=$(echo "$RESPONSE" | jq -r '.data.data.link')
-          FILE_NAME=$(echo "$RESPONSE" | jq -r '.data.data.file_name')
+          # Extract channel/username and post ID
+          # Format: https://t.me/channelname/postid
+          CHANNEL=$(echo "$LINK" | grep -oP '(?<=/)[^/]+(?=/)')
+          POST_ID=$(echo "$LINK" | grep -oP '(?<=/)[^/]+$')
           
-          if [ -z "$RAW_URL" ] || [ "$RAW_URL" = "null" ]; then
-            echo "❌ Error: Could not get download link!"
-            echo "Response: $RESPONSE"
+          if [ -z "$CHANNEL" ] || [ -z "$POST_ID" ]; then
+            echo "❌ Could not extract channel or post ID from link."
+            echo "Please ensure the link is in format: https://t.me/channelname/postid"
             exit 1
           fi
           
-          # Convert spaces to dash in URL
-          CORRECTED_URL=$(echo "$RAW_URL" | sed 's/%20/-/g' | sed 's/ /-/g')
-          echo "✅ Direct link received!"
-          echo "📄 Original filename: $FILE_NAME"
-          echo "download_url=$CORRECTED_URL" >> $GITHUB_OUTPUT
-          echo "original_name=$FILE_NAME" >> $GITHUB_OUTPUT
+          echo "📂 Channel: $CHANNEL"
+          echo "🆔 Post ID: $POST_ID"
+          
+          echo "channel=$CHANNEL" >> $GITHUB_OUTPUT
+          echo "post_id=$POST_ID" >> $GITHUB_OUTPUT
 
-      - name: ⬇️ Download file with aria2c
+      - name: ⬇️ Download file with yt-dlp
         id: download
         run: |
-          URL="${{ steps.get_link.outputs.download_url }}"
-          ORIGINAL_NAME="${{ steps.get_link.outputs.original_name }}"
+          CHANNEL="${{ steps.extract.outputs.channel }}"
+          POST_ID="${{ steps.extract.outputs.post_id }}"
+          
           mkdir -p downloads
-
-          # Prepare filename with extension logic
-          BASE_NAME="${ORIGINAL_NAME%.*}"
-          EXT="${ORIGINAL_NAME##*.}"
-          
-          # If the file has no extension, EXT will be same as ORIGINAL_NAME
-          if [[ "$EXT" == "$ORIGINAL_NAME" ]]; then
-            EXT=""
-          else
-            EXT=".$EXT"
-          fi
-          
-          FINAL_NAME="$ORIGINAL_NAME"
-          COUNTER=1
-          
-          # Check for duplicates
-          while [ -f "downloads/$FINAL_NAME" ]; do
-            if [ -n "$EXT" ]; then
-              FINAL_NAME="${BASE_NAME}_${COUNTER}${EXT}"
-            else
-              FINAL_NAME="${BASE_NAME}_${COUNTER}"
-            fi
-            COUNTER=$((COUNTER + 1))
-          done
-          
-          if [ "$FINAL_NAME" != "$ORIGINAL_NAME" ]; then
-            echo "⚠️ File already exists! Renaming to: $FINAL_NAME"
-          fi
           
           echo "═══════════════════════════════════════════════════════════════"
-          echo "⬇️ Downloading: $FINAL_NAME"
-          echo "URL: $URL"
+          echo "⬇️ Downloading from t.me/$CHANNEL/$POST_ID"
           echo "═══════════════════════════════════════════════════════════════"
 
-          # Download using aria2c
-          aria2c --dir=downloads \
-                 --out="$FINAL_NAME" \
-                 --header="User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
-                 --header="Referer: https://telegramdownloader.net/" \
-                 --max-connection-per-server=16 \
-                 --min-split-size=1M \
-                 --retry-wait=30 \
-                 --max-tries=10 \
-                 --timeout=60 \
-                 --continue \
-                 "$URL"
+          # Use yt-dlp to download the media
+          # --no-check-cert: Skip certificate verification if needed
+          # -o: Output template
+          yt-dlp --no-check-cert \
+                 -o "downloads/%(title)s.%(ext)s" \
+                 "https://t.me/$CHANNEL/$POST_ID"
 
-          # Verify download
-          if [ ! -f "downloads/$FINAL_NAME" ]; then
-            echo "❌ Download failed! File not found."
+          # Check if download was successful
+          if [ ! -f "downloads/*" ]; then
+            echo "❌ Download failed! No file found in downloads."
             exit 1
           fi
 
-          SIZE=$(stat -c%s "downloads/$FINAL_NAME")
+          # Get the downloaded file name
+          DOWNLOADED_FILE=$(ls downloads/* | head -n 1)
+          FINAL_NAME=$(basename "$DOWNLOADED_FILE")
           
-          # Check if file is too small (likely an error page)
+          SIZE=$(stat -c%s "$DOWNLOADED_FILE")
+          
           if [ "$SIZE" -lt 10240 ]; then
             echo "❌ ERROR: Invalid file (${SIZE} bytes)"
-            cat "downloads/$FINAL_NAME" 2>/dev/null | head -n 10
-            rm "downloads/$FINAL_NAME"
+            rm "$DOWNLOADED_FILE"
             exit 1
           fi
 
@@ -140,7 +102,6 @@ jobs:
           FILENAME="${{ steps.download.outputs.downloaded_name }}"
           FILE_SIZE="${{ steps.download.outputs.file_size }}"
           
-          # Calculate limit in bytes
           LIMIT=$((THRESHOLD * 1024 * 1024))
           
           if [ -n "$FILE_SIZE" ] && [ "$FILE_SIZE" -gt "$LIMIT" ]; then
@@ -148,11 +109,9 @@ jobs:
             cd downloads
             
             # Create zip split
-            # -s: split size
-            # -j: junk paths (store just filenames)
             zip -s "${THRESHOLD}m" "${FILENAME}.zip" -j "$FILENAME"
             
-            # Remove the original file, keeping only the zip parts
+            # Remove the original file
             rm "$FILENAME"
             
             cd ..
@@ -165,19 +124,16 @@ jobs:
             [ -e "$file" ] || continue
             EXT="${file##*.}"
             
-            # Handle files without extension
             if [[ "$EXT" == "$file" ]]; then
               EXT="bin"
             fi
             
-            # Check if filename contains non-ASCII characters
             if [[ "$file" =~ [^[:ascii:]] ]]; then
               RANDOM_NAME=$(openssl rand -hex 8)
               NEW_NAME="${RANDOM_NAME}.${EXT}"
               echo "   🌐 Renaming: $file -> $NEW_NAME"
               mv "$file" "$NEW_NAME"
             else
-              # Clean special characters
               CLEAN_NAME=$(echo "$file" | sed 's/[^a-zA-Z0-9._-]/_/g' | sed 's/__*/_/g')
               if [ "$file" != "$CLEAN_NAME" ]; then
                 echo "   📝 Cleaning: $file -> $CLEAN_NAME"
@@ -197,7 +153,6 @@ jobs:
             exit 1
           fi
           
-          # Get list of new files only
           NEW_FILES=()
           for file in downloads/*; do
             filename=$(basename "$file")
@@ -218,7 +173,6 @@ jobs:
           echo "📦 Total new files to upload: $TOTAL"
           echo "═══════════════════════════════════════════════════════════════"
           
-          # Upload ONE file at a time
           for (( i=0; i<TOTAL; i++ )); do
             echo ""
             echo "🚀 Uploading file $((i+1)) of $TOTAL: ${NEW_FILES[$i]}"
